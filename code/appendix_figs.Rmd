@@ -1,0 +1,685 @@
+---
+title: "appendix_figs.Rmd"
+author: "Alex Franks"
+date: "8/2/2021"
+output: 
+  html_document: default
+  self_contained: no
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(dev = "pdf")
+library(haven)
+library(tidyverse)
+library(tidybayes)
+library(cmdstanr)
+library(posterior)
+library(lmtest)
+library(broom)
+library(readxl)
+library(ggrepel)
+library(patchwork)
+options(digits=3)
+options(dev = "pdf")
+# opts_chunk$set(dev = "pdf")
+
+knitr::opts_chunk$set(dev = "pdf")
+knitr::opts_chunk$set(fig.path = "../figs/appendix/")
+```
+
+```{r}
+start_year <- 1997
+end_year <- 2018
+
+t_int <- 2007
+
+guns <- read_dta("ucrpanel2.dta")
+
+crimes <- read_dta("ucrthrough2018.dta") %>%
+    mutate(across(c(violent_crime, homicide, rape_legacy, rape_revised, robbery,
+           aggravated_assault, property_crime, burglary, larceny,
+           motor_vehicle_theft),
+           as.integer)) %>%
+    rename(State = state_abbr, rape_rate = rape_legacy_rate, 
+           murder_rate = homicide_rate, violent_rate = violent_crime_rate,
+           assault_rate = aggravated_assault_rate,
+           property_rate = property_crime_rate,
+           mvt_rate = motor_vehicle_theft_rate, 
+           Population = population) %>%
+    filter(State != "DC") %>%
+    # drop rape rate after 2015 since it switches to new definition
+    mutate(rape_rate = ifelse(year > 2016, NA, rape_rate),
+           treated = State == "CA", trt = treated * (year >= 2007))
+
+if(start_year < 1995) {
+  crimes <- crimes %>% filter(State != "MS")
+}
+
+
+guns %>%
+    mutate(treated = State == "CA", trt = treated * (year >= 2007)) %>%
+    mutate_at(vars(contains("rate")), list(log = log)) -> guns
+
+# merge in covariates
+cov_data <- read_excel("covariates_2005.xls") %>%
+  mutate(logincome = log10(income)) %>%
+  rename_with( ~ str_c(., "_2005"), -c(state,year)) %>%
+  select(-year)
+
+
+guns %>%
+  inner_join(cov_data, by = c("State" = "state")) -> guns
+
+
+gunrate_states <- guns %>% 
+    filter(year >= start_year, year <= end_year,
+           State != "DC", is.na(gunrate)) %>%
+    distinct(State) %>% pull(State)
+guns %>%
+  inner_join(cov_data, by = c("State" = "state")) -> guns
+
+
+gunrate_states <- guns %>% 
+    filter(year >= start_year, year <= end_year,
+           State != "DC", is.na(gunrate)) %>%
+    distinct(State) %>% pull(State)
+
+```
+
+
+```{r, utility_functions}
+
+get_posterior_gauss <- function(fit_mtgp) {
+  draws <- as_draws_matrix(fit_mtgp$draws())
+  means <- subset(draws, variable = "f")
+  ppds <- subset(draws, variable = "f_samples")
+  sigs <- subset(draws, variable = "sigman")
+
+  return(list(mean_fn=means, ppd=ppds, sd=sigs))
+}
+
+get_posterior_pois <- function(fit_mtgp) {
+  draws <- as_draws_matrix(fit_mtgp$draws())
+  means <- subset(draws, variable = "f")
+  ppds <- subset(draws, variable = "f_samples")
+  return(list(mean_fn=means, ppd=ppds))
+}
+
+
+
+organize_post_samples <- function(post, ppd, unit, time, data) {
+  
+  time <- enquo(time)
+  unit <- enquo(unit)
+  times <- data %>% distinct(!!time) %>% pull(!!time)
+  units <- data %>% distinct(!!unit) %>% pull(!!unit)
+  
+  # get time-unit-sample pairs
+  time <- as_label(time)
+  unit <- as_label(unit)
+  
+  times_units_samples <- expand.grid(1:nrow(post), times, units)
+
+  names(times_units_samples) <- c("sample", time, unit)
+  times_units_samples$mean_fn <- c(post)
+  times_units_samples$ppd <- c(ppd)
+
+  return(left_join(times_units_samples,
+                   data[, c("year", "State", "homicide", "Population")],
+                   by=c("year", "State")))
+  
+}
+
+```
+
+```{r}
+res_gaus <- readRDS("../results/mtgp_fits_homoskedastic.RDS")
+res_pois <- readRDS("../results/mtgp_fits_poisson.RDS")
+names(res_gaus) <- 1:length(res_gaus) - 1
+names(res_pois) <- 1:length(res_pois) - 1
+```
+
+
+## Ranks 0-7 (Poisson)
+
+```{r pre_process}
+ranks <- 0:7
+
+posts_pois <- lapply(res_pois, get_posterior_pois)
+
+post_pred_ranks_pois <- lapply(ranks, function(r) organize_post_samples(posts_pois[[r+1]]$mean_fn, 
+                                                                        posts_pois[[r+1]]$ppd,
+                                                                        unit = State, time = year, 
+                                                                        data = crimes %>% filter(year >= start_year)))
+
+names(post_pred_ranks_pois) <- ranks
+
+```
+
+
+```{r ca_pois_balance_raw}
+bind_rows(
+  post_pred_ranks_pois, .id = "Rank"
+  ) %>%
+  group_by(year, State, Rank) %>%
+  filter(year < 2007) %>%
+  filter(State == "CA") %>%
+  summarise(
+        post_pred_mean = mean(ppd),
+        post_pred_upper = quantile(ppd, .975),
+        post_pred_lower = quantile(ppd, .025),
+        post_pred_upper50 = quantile(ppd, 0.75),
+        post_pred_lower50 = quantile(ppd, 0.25)
+      ) %>%
+  inner_join(crimes, by = c("State", "year")) %>%
+  ggplot(aes(x = year, group = State)) +
+  geom_ribbon(aes(ymax = post_pred_upper/ (Population / 1e5), ymin = post_pred_lower/ (Population / 1e5)),
+              fill = "grey50", alpha = .5) +
+  geom_ribbon(aes(ymax = post_pred_upper50/ (Population / 1e5), ymin = post_pred_lower50/ (Population / 1e5)),
+              fill = "grey20", alpha = .5) +
+  geom_line(aes(y = post_pred_mean / (Population / 1e5)), lwd = 1.25) + #color = rgb(228,26,28, maxColorValue = 255)) +
+  geom_line(aes(y = murder_rate), lwd = 1, color = rgb(228,26,28, maxColorValue = 255)) +
+  # geom_vline(xintercept = 2007, lty = 2) +
+  facet_wrap(~ Rank, labeller = label_both, ncol=4) +
+  xlab("") +
+  ylab("Homicides per 100,000") +
+  # ggtitle("Observed and posterior predictive distribution of homicide counts") +
+  ggtitle("Observed and posterior predictive dist for California") + 
+  theme_bw()
+```
+
+## Poisson all ranks
+
+```{r ca_plot_pois_ranks}
+
+bind_rows(
+  post_pred_ranks_pois, .id = "Rank"
+  ) %>%
+  group_by(year, State, Rank) %>%
+  summarise(
+        post_pred_mean = mean(ppd),
+        post_pred_upper = quantile(ppd, .975),
+        post_pred_lower = quantile(ppd, .025)
+      ) %>%
+  inner_join(crimes, by = c("State", "year")) %>%
+  filter(State == "CA") %>%
+  ggplot(aes(x = year, group = State)) +
+  geom_ribbon(aes(ymax = post_pred_upper/ (Population / 1e5), ymin = post_pred_lower/ (Population / 1e5)),
+              fill = "grey50", alpha = .5) +
+  geom_line(aes(y = post_pred_mean / (Population / 1e5)), color = rgb(228,26,28, maxColorValue = 255)) +
+  geom_line(aes(y = murder_rate)) +
+  geom_vline(xintercept = 2007, lty = 2) +
+  facet_wrap(~ Rank, labeller = label_both, ncol=4) +
+  xlab("") +
+  ylab("Homicides per 100,000") +
+  ggtitle("Observed and posterior predictive distribution of homicide counts") +
+  theme_bw()
+```
+## Gaussian all ranks
+
+```{r pre_process_gauss}
+ranks <- 0:7
+
+posts_gaus <- lapply(res_gaus, get_posterior_gauss)
+
+post_pred_ranks_gaus <- lapply(ranks, function(r) organize_post_samples(posts_pois[[r+1]]$mean_fn, 
+                                                                        posts_pois[[r+1]]$ppd,
+                                                                        unit = State, time = year, 
+                                                                        data = crimes %>% filter(year >= start_year)))
+
+names(post_pred_ranks_gaus) <- ranks
+
+```
+
+
+```{r ca_plot_h_ranks}
+
+bind_rows(
+  post_pred_ranks_gaus, .id = "Rank"
+  ) %>% 
+  group_by(year, State, Rank)  %>%
+  summarise(
+        post_pred_mean = mean(ppd/Population*1e5),
+        post_pred_upper = quantile(ppd/Population*1e5, .975),
+        post_pred_lower = quantile(ppd/Population*1e5, .025)
+      ) %>%
+  inner_join(crimes, by = c("State", "year")) %>%
+  filter(State == "CA") %>%
+  ggplot(aes(x = year, group = State)) +
+  geom_ribbon(aes(ymax = post_pred_upper, ymin = post_pred_lower),
+              fill = "grey50", alpha = .5) +
+  geom_line(aes(y = post_pred_mean), color = rgb(228,26,28, maxColorValue = 255)) +
+  geom_line(aes(y = murder_rate)) +
+  geom_vline(xintercept = 2007, lty = 2) +
+  facet_wrap(~ Rank, labeller = label_both, ncol=4) +
+  xlab("") +
+  ylab("Homicides per 100,000") +
+  ggtitle("Observed and posterior predictive distribution of homicide rates") +
+  theme_bw()
+```
+
+## With Linear Adjustments
+
+```{r}
+res_gaus_adj <- readRDS("../results/mtgp_fits_homoskedastic_linear_adj.RDS")
+res_pois_adj <- readRDS("../results/mtgp_fits_poisson_linear_adj.RDS")
+```
+
+
+## Poisson all ranks (covaraite adjusted)
+
+```{r pre_process_adj}
+ranks <- 0:7
+
+posts_pois <- lapply(res_pois_adj, get_posterior_pois)
+
+post_pred_ranks_pois <- lapply(ranks, function(r) organize_post_samples(posts_pois[[r+1]]$mean_fn, 
+                                                                        posts_pois[[r+1]]$ppd,
+                                                                        unit = State, time = year, 
+                                                                        data = crimes %>% filter(year >= start_year)))
+
+names(post_pred_ranks_pois) <- ranks
+
+```
+
+```{r ca_plot_pois_ranks_adj}
+
+bind_rows(
+  post_pred_ranks_pois, .id = "Rank"
+  ) %>%
+  group_by(year, State, Rank) %>%
+  summarise(
+        post_pred_mean = mean(ppd),
+        post_pred_upper = quantile(ppd, .975),
+        post_pred_lower = quantile(ppd, .025)
+      ) %>%
+  inner_join(crimes, by = c("State", "year")) %>%
+  filter(State == "CA") %>%
+  ggplot(aes(x = year, group = State)) +
+  geom_ribbon(aes(ymax = post_pred_upper/ (Population / 1e5), ymin = post_pred_lower/ (Population / 1e5)),
+              fill = "grey50", alpha = .5) +
+  geom_line(aes(y = post_pred_mean / (Population / 1e5)), color = rgb(228,26,28, maxColorValue = 255)) +
+  geom_line(aes(y = murder_rate)) +
+  geom_vline(xintercept = 2007, lty = 2) +
+  facet_wrap(~ Rank, labeller = label_both, ncol=4) +
+  xlab("") +
+  ylab("Homicides per 100,000") +
+  ggtitle("Observed and posterior predictive distribution of homicide counts") +
+  theme_bw()
+```
+
+
+## Gaussian all ranks (covariate adjusted)
+
+```{r pre_process_gaus_adj}
+ranks <- 0:7
+
+posts_gaus <- lapply(res_gaus_adj, get_posterior_gauss)
+
+post_pred_ranks_gaus <- lapply(ranks, function(r) organize_post_samples(posts_pois[[r+1]]$mean_fn, 
+                                                                        posts_pois[[r+1]]$ppd,
+                                                                        unit = State, time = year, 
+                                                                        data = crimes %>% filter(year >= start_year)))
+
+names(post_pred_ranks_gaus) <- ranks
+
+```
+
+
+```{r ca_plot_gauss_ranks_adj}
+
+bind_rows(
+  post_pred_ranks_gaus, .id = "Rank"
+  ) %>% 
+  group_by(year, State, Rank)  %>%
+  summarise(
+        post_pred_mean = mean(ppd/Population*1e5),
+        post_pred_upper = quantile(ppd/Population*1e5, .975),
+        post_pred_lower = quantile(ppd/Population*1e5, .025)
+      ) %>%
+  inner_join(crimes, by = c("State", "year")) %>%
+  filter(State == "CA") %>%
+  ggplot(aes(x = year, group = State)) +
+  geom_ribbon(aes(ymax = post_pred_upper, ymin = post_pred_lower),
+              fill = "grey50", alpha = .5) +
+  geom_line(aes(y = post_pred_mean), color = rgb(228,26,28, maxColorValue = 255)) +
+  geom_line(aes(y = murder_rate)) +
+  geom_vline(xintercept = 2007, lty = 2) +
+  facet_wrap(~ Rank, labeller = label_both, ncol=4) +
+  xlab("") +
+  ylab("Homicides per 100,000") +
+  ggtitle("Observed and posterior predictive distribution of homicide rates") +
+  theme_bw()
+```
+
+
+## Coverage Plot (Poisson)
+
+```{r, coverage_plot}
+
+coverage_fn <- function(...){
+  summarize(...,  mse_true = 
+              sqrt(mean((mean_fn/scaled_population - homicide/scaled_population)^2)), 
+                  mse_ppd = sqrt(mean((mean_fn/scaled_population - ppd/scaled_population)^2))) }
+
+compute_coverage <- function(rank) {
+  fit <- res_pois[[rank]]
+  post <- get_posterior_pois(fit)$mean_fn
+  y_pred <- get_posterior_pois(fit)$ppd
+  post_data <- organize_post_samples(post,
+                                     y_pred,
+                                     unit = State,
+                                     time = year,
+                                     data = crimes %>% filter(year >= start_year))
+
+  coverage_by_state = post_data %>% 
+    filter(!(State=="CA" & year > t_int)) %>% 
+    mutate(scaled_population =  Population/1e5) %>% 
+    group_by(year, State) %>% 
+    summarize(q975=quantile(ppd, 0.975),
+              q75=quantile(ppd, 0.75),
+              q25=quantile(ppd, 0.25),
+              q025=quantile(ppd, 0.025),
+              homicide=median(homicide)) %>% 
+    ungroup() %>% 
+    group_by(State) %>% 
+    summarize(`95%`=1-mean(homicide > q975 | homicide < q025),
+              `50%`=1-mean(homicide > q75 | homicide < q25)) 
+  coverage_by_state %>% 
+    add_row(State="AVG", 
+            `95%`=mean(coverage_by_state$`95%`),
+            `50%`=mean(coverage_by_state$`50%`)) %>% 
+    mutate(rank=rank)
+}
+
+coverage_results <- map_dfr(names(res_gaus), 
+        function(x) compute_coverage(x)) %>% 
+        mutate(rank = as.factor(rank))
+
+coverage_results %>% filter(State=="AVG") %>% 
+  pivot_longer(2:3, names_to="Type", values_to="Coverage") %>%
+  ggplot() + geom_line(aes(x=as.numeric(rank)-1, y=Coverage, col=Type), size=1.5) +   geom_hline(yintercept=0.5, linetype="dashed") + 
+  geom_hline(data=tibble(M=c("95%", "50%"), val=c(0.95, 0.5)), aes(yintercept=val, col=M), linetype="dashed") + 
+  ylim(c(0, 1)) + theme_bw(base_size=16) + xlab("Rank") + ggtitle("Poisson")
+
+```
+
+### Coverage Plot (Gaussian)
+
+```{r, coverage_plot_gauss}
+
+coverage_fn <- function(...){
+  summarize(...,  mse_true = 
+              sqrt(mean((mean_fn/scaled_population - homicide/scaled_population)^2)), 
+                  mse_ppd = sqrt(mean((mean_fn/scaled_population - ppd/scaled_population)^2))) }
+
+compute_coverage <- function(rank) {
+  fit <- res_gaus[[rank]]
+  post <- get_posterior_pois(fit)$mean_fn
+  y_pred <- get_posterior_pois(fit)$ppd
+  post_data <- organize_post_samples(post,
+                                     y_pred,
+                                     unit = State,
+                                     time = year,
+                                     data = crimes %>% filter(year >= start_year))
+
+  coverage_by_state = post_data %>% 
+    filter(!(State=="CA" & year > t_int)) %>% 
+    mutate(scaled_population =  Population/1e5) %>% 
+    group_by(year, State) %>% 
+    summarize(q975=quantile(ppd, 0.975),
+              q75=quantile(ppd, 0.75),
+              q25=quantile(ppd, 0.25),
+              q025=quantile(ppd, 0.025),
+              homicide=median(homicide/scaled_population)) %>% 
+    ungroup() %>% 
+    group_by(State) %>% 
+    summarize(`95%`=1-mean(homicide > q975 | homicide < q025),
+              `50%`=1-mean(homicide > q75 | homicide < q25)) 
+  coverage_by_state %>% 
+    add_row(State="AVG", 
+            `95%`=mean(coverage_by_state$`95%`),
+            `50%`=mean(coverage_by_state$`50%`)) %>% 
+    mutate(rank=rank)
+}
+
+coverage_results <- map_dfr(names(res_gaus), 
+        function(x) compute_coverage(x)) %>% 
+        mutate(rank = as.factor(rank))
+
+coverage_results %>% filter(State=="AVG") %>% 
+  pivot_longer(2:3, names_to="Type", values_to="Coverage") %>%
+  ggplot() + geom_line(aes(x=as.numeric(rank)-1, y=Coverage, col=Type), size=1.5) +   geom_hline(yintercept=0.5, linetype="dashed") + 
+  geom_hline(data=tibble(M=c("95%", "50%"), val=c(0.95, 0.5)), aes(yintercept=val, col=M), linetype="dashed") + 
+  ylim(c(0, 1)) + theme_bw(base_size=16) + xlab("Rank") + ggtitle("Gaussian")
+
+```
+
+## Global factor (rank 5)
+```{r, global_factor}
+fit_mtgp <- res_gaus[["5"]]
+start_year <- 1997
+end_year <- 2018
+
+global_avg <- as_draws_matrix(fit_mtgp$draws()) %>% spread_draws(L_global[N1, N2], z_global[N1], global_offset) %>%
+  group_by(.draw) %>% group_split() %>% map_dfr(.f = function(x) {
+  L_global <- matrix(x$L_global, nrow=max(x$N1), ncol=max(x$N2), byrow=TRUE)
+  z_global <- x %>% filter(N2==1) %>% pull(z_global)
+  tibble(.draw = x$`.draw`[1], Year = start_year:end_year, f_global = as.numeric(L_global %*% z_global) + x$global_offset[1])
+})
+
+global_avg %>% group_by(Year) %>% 
+  summarize(mean_f = mean(f_global), q025 = quantile(f_global, 0.025), q975 = quantile(f_global, 0.975)) %>%
+  ggplot(aes(x=Year)) +  
+  geom_ribbon(aes(ymax = q975, ymin = q025),
+              fill = "grey50", alpha = .5) +
+  geom_line(aes(y=mean_f)) + theme_bw(base_size=16) + ylab("Homicides per 100,000") + ggtitle("Homicides per 100,000 (State Average)")
+```
+
+## Individual factors
+
+```{r, factor_analysis}
+fit_mtgp <- res_gaus[[6]]
+
+offsets <- as_draws_matrix(fit_mtgp$draws()) %>% spread_draws(state_offset[D])
+
+Ltibble <- as_draws_matrix(fit_mtgp$draws()) %>% spread_draws(L_f[N1, N2])
+Ztibble <- as_draws_matrix(fit_mtgp$draws()) %>% spread_draws(z_f[N1, K])
+Wtibble <- as_draws_matrix(fit_mtgp$draws()) %>% spread_draws(k_f[K, D])
+sigman <- as_draws_matrix(fit_mtgp$draws()) %>% spread_draws(sigman)
+population <- crimes %>% group_by(State) %>% summarize(pop = mean(Population)/1e5) %>% pull(pop)
+
+N <- max(Ltibble$N1)
+K <- max(Ztibble$K)
+D <- max(Wtibble$D)
+ndraws <- max(Ltibble$`.draw`)
+f_array <- array(0, dim=c(ndraws, N, K))
+w_array <- array(0, dim=c(ndraws, K, D))
+
+L <- matrix(Ltibble %>% filter(.draw == 2000) %>% pull(L_f), nrow=N, ncol=N, byrow=TRUE)
+Z <- matrix(Ztibble %>% filter(.draw == 2000) %>% pull(z_f), nrow=N, ncol=K, byrow=TRUE)
+W <- matrix(Wtibble %>% filter(.draw == 2000) %>% pull(k_f), nrow=K, ncol=D, byrow=TRUE)
+
+Fbaseline <- svd(L %*% Z)$u
+
+for(d in 1:ndraws) {
+  # if(d %% 50 == 0)
+  #   print(d)
+  L <- matrix(Ltibble %>% filter(.draw == d) %>% pull(L_f), nrow=N, ncol=N, byrow=TRUE)
+  Z <- matrix(Ztibble %>% filter(.draw == d) %>% pull(z_f), nrow=N, ncol=K, byrow=TRUE)
+  W <- matrix(Wtibble %>% filter(.draw == d) %>% pull(k_f), nrow=K, ncol=D, byrow=TRUE)
+  
+  ones_vec <- cbind(rep(1/sqrt(N), N))
+  svdF <- svd((diag(N) - ones_vec %*% t(ones_vec)) %*% L %*% Z)
+  F <- svdF$u
+  
+  svd_res <- svd(t(Fbaseline) %*% F)
+  R <-  svd_res$u %*% t(svd_res$v)
+  f_array[d, ,] <- F %*% t(R)
+  w_array[d, , ] <- R %*% diag(svdF$d) %*% t(svdF$v) %*% W
+  
+}
+
+
+mean_factors <- apply(f_array, 2:3, mean)
+colnames(mean_factors) <- paste("Factor", 1:dim(f_array)[3])
+factor_tibble <- as_tibble(mean_factors)
+factor_tibble$year <- start_year:end_year
+
+factor_tibble %>% pivot_longer(cols=-year, names_to="Factor") %>% 
+  ggplot() + geom_line(aes(x=year, y=value, col=Factor)) + theme_bw()
+
+Wmean <- apply(w_array, 2:3, mean)
+wsvd <- svd(Wmean)
+Wmean <- diag(wsvd$d) %*% t(wsvd$v)
+colnames(Wmean) <- unique(crimes$State)
+
+mean_factors <- apply(f_array, 2:3, mean)
+colnames(mean_factors) <- paste("Factor", 1:dim(f_array)[3])
+mean_factors %*% wsvd$u
+
+state_indices <- unique(crimes$State)
+
+sgn <- sign(Wmean[, "CA"])
+Wmean <- Wmean * sgn
+w_sds <- apply(Wmean, 1, sd)
+Wmean <- Wmean/w_sds
+mean_factors <- t(sgn*t(mean_factors)*w_sds)
+ 
+factor_tibble <- as_tibble(mean_factors)
+factor_tibble$year <- start_year:end_year
+
+factors_plot <- factor_tibble %>% pivot_longer(cols=-year, names_to="Factor") %>% 
+  ggplot() + geom_line(aes(x=year, y=value, col=Factor)) + theme_bw() + geom_hline(yintercept=0, linetype="dashed")
+
+
+
+ca_loadings_plot <- tibble(Loadings=Wmean[, "CA"], fact=colnames(mean_factors)) %>% ggplot(aes(x=fact, y=Loadings)) + geom_bar(stat="identity") + ylab("Loadings for California") + xlab("") + theme_bw() + coord_flip() 
+ca_loadings_plot
+
+factors_plot / ca_loadings_plot
+
+```
+
+
+
+## Multi-output correlation
+
+```{r read_data_transform_mo}
+
+start_year <- 1997
+end_year <- 2016
+t_int <- 2007
+gunrate_states <- read_dta("ucrpanel2.dta") %>% 
+  filter(year >= start_year, year <= end_year, State != "DC") %>% 
+  group_by(State) %>% 
+  summarise(hasguns=sum(nongunrate)) %>% 
+  drop_na() %>% 
+  pull(State)
+# put the data into long format
+read_dta("ucrpanel2.dta") %>% 
+  filter(State != "DC") %>% 
+  filter(year >= start_year) %>% 
+  filter(year <= end_year) %>% 
+  select(year, State, Population, gunrate, nongunrate) %>%
+  pivot_longer(cols=c('gunrate', 'nongunrate'), names_to="crime_type") %>%
+  filter(State %in% gunrate_states) %>% 
+  drop_na() %>%
+  mutate(
+    treated=(State == "CA") * (year >= 2007),
+    inv_pop=1/(Population/1e5),
+    value_per=(value)
+  ) -> long_df
+num_years = end_year - start_year + 1
+num_units = length(unique(long_df$State))
+num_outcomes = 2
+year_vector = start_year:end_year
+# shape into a three dimensional array that is [outcome, year, unit]
+murder_assault_arr = aperm(
+  array(as.matrix(long_df  %>% select(value_per)), dim = c(num_years, num_units, 2)), 
+  c(3, 1, 2)
+)
+control_idx = which(
+  as.matrix(long_df %>% filter(crime_type=='gunrate') %>% select(treated)) == 0
+)
+inv_population = matrix(as.matrix((
+  long_df %>% filter(crime_type == 'gunrate') %>% select(inv_pop) 
+)), num_years, num_units)
+```
+
+
+## Functions
+```{r}
+
+organize_post_samples <- function(samples, unit, time, data, noutcomes=1) {
+  time <- enquo(time)
+  unit <- enquo(unit)
+  times <- data %>% distinct(!!time) %>% pull(!!time)
+  units <- data %>% distinct(!!unit) %>% pull(!!unit)
+  
+  # get time-unit-sample pairs
+  time <- as_label(time)
+  unit <- as_label(unit)
+  times_units_samples <- expand.grid(1:max(samples$.draw), units, times, 1:noutcomes)
+  names(times_units_samples) <- c("sample", unit, time, "crime_type")
+  times_units_samples <- times_units_samples %>% mutate(crime_type = ifelse(crime_type==1, "gunrate", "nongunrate"))
+  times_units_samples %>% mutate(year=as.integer(year))
+  data <- data %>% mutate(year == as.integer(year))
+  times_units_samples <- cbind(times_units_samples, samples)
+
+  return(left_join(times_units_samples,
+                   data[, c("year", "State", "crime_type", "value", "inv_pop")],
+                   by=c("year", "State", "crime_type")))
+  
+}
+
+```
+
+
+```{r gaus_summary_mo}
+## Homoskedastic Gaussian
+# res_gaus <- readRDS("../../results/mtgp_fits_homoskedastic.RDS")
+
+res <- readRDS("../results/mo_sweep.rds")
+
+all_samples <- map_dfr(names(res), function(rank_name) {
+  print(rank_name)
+  fit <- res[[rank_name]]
+  draws <- as_draws_matrix(fit)
+  samps <- draws %>% spread_draws(f[M, N, D], f_samples[M, N, D], sigman[M])
+  all_samples <- organize_post_samples(samps, unit = State,
+                        time = year,
+                        data = long_df %>% filter(year >= start_year),
+                        noutcomes = max(samps$M))
+
+  all_samples$rank <- rank_name
+  all_samples
+})
+
+compute_summary_gaus <- function(all_samples, summary_function, group_vars = vars(sample, crime_type, rank), filters = function(...){ filter(..., year < t_int, State == "CA") }) {
+  
+  results_table <- all_samples %>%
+    filters %>% 
+    group_by(!!!group_vars) %>%
+    summary_function
+
+    results_table
+}
+
+```
+
+```{r mo_cor}
+
+cor_fn <- function(...){ 
+  pivot_wider(..., id_cols = c("sample", "State", "year", "rank"), names_from="crime_type", names_sep = ".", values_from = c(f, f_samples, value)) %>%
+  summarize(cor_obs = cor(value.gunrate, value.nongunrate), 
+            cor_ppd = cor(f_samples.gunrate, f_samples.nongunrate)) }
+
+cor_table_ca <- compute_summary_gaus(all_samples %>% filter(rank == 5), cor_fn, group_vars=vars(sample, State, rank))
+
+
+cor_table_ca %>% ggplot() + geom_density(aes(x=cor_ppd), fill="gray") + xlim(c(-1, 1)) + theme_bw(base_size=16) + ggtitle("Posterior Predictive Correlation", subtitle="between Gun and Non-gun related homicides (California)") + xlab("Correlation") + ylab("")
+#+ geom_vline(aes(xintercept=cor_obs), linetype="dashed", col="blue")
+
+```
