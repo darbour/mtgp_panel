@@ -1,0 +1,209 @@
+---
+output:
+  html_document: default
+  pdf_document: default
+---
+```{r, boilerplate}
+knitr::opts_chunk$set(dev = "pdf")
+library(haven)
+library(tidyverse)
+library(cmdstanr)
+library(posterior)
+```
+
+
+```{r read_data_transform}
+
+start_year <- 1997
+end_year <- 2018
+
+t_int <- 2007
+
+read_dta("../data/ucrthrough2018.dta") %>%
+    mutate(across(c(violent_crime, homicide, rape_legacy, rape_revised, robbery,
+           aggravated_assault, property_crime, burglary, larceny,
+           motor_vehicle_theft),
+           as.integer)) %>%
+    rename(State = state_abbr, rape_rate = rape_legacy_rate, 
+           murder_rate = homicide_rate, violent_rate = violent_crime_rate,
+           assault_rate = aggravated_assault_rate,
+           property_rate = property_crime_rate,
+           mvt_rate = motor_vehicle_theft_rate, 
+           Population = population) %>%
+    filter(State != "DC") %>%
+    # drop rape rate after 2015 since it switches to new definition
+    mutate(rape_rate = ifelse(year > 2016, NA, rape_rate),
+           treated = State == "CA", trt = treated * (year >= 2007)) -> crimes
+
+if(start_year < 1995) {
+  crimes <- crimes %>% filter(State != "MS")
+}
+
+make_stan_data <- function(outcome, trt, unit, time, t_int, data) {
+
+  # x is vector of times
+  x <- data %>% distinct(!!time) %>% pull(!!time)
+
+  out <- augsynth:::format_data(outcome, trt, unit, time,
+                                t_int, data)
+
+  pop <- augsynth:::format_data(quo(Population), trt, unit, time,
+                                t_int, data)
+  # rows of y are time periods, columns units
+  y <- t(cbind(out$X, out$y))
+  pop <- t(cbind(pop$X, pop$y))
+  # get the heldout indices
+  excl_idx <- matrix(1:length(y), nrow(y), ncol(y))[x >= t_int, out$trt == 1]
+  cntrl_idx <- (1:length(y))[-excl_idx]
+  treated_idx = which(out$trt == 1)
+  return(list(x = x, y = y, control_idx = cntrl_idx, pop = pop, treated_idx=treated_idx))
+}
+
+get_post_pred_samples <- function(post, unit, time, data) {
+  
+  time <- enquo(time)
+  unit <- enquo(unit)
+  times <- data %>% distinct(!!time) %>% pull(!!time)
+  units <- data %>% distinct(!!unit) %>% pull(!!unit)
+  
+  # post <- get_posterior(fit_mtgp)
+  
+  # get time-unit-sample pairs
+  time <- as.character(time)[2]
+  unit <- as.character(unit)[2]
+  times_units_samples <- expand.grid(1:nrow(post), times, units)
+  names(times_units_samples) <- c("sample", time, unit)
+  times_units_samples$y <- c(post)
+  return(times_units_samples)
+}
+
+fit_mtgp_normal <- function(outcome, trt, unit, time, t_int, data, n_k_f,
+                                   iter_warmup = 1000, iter_sampling = 1000,
+                                   chains = 4, parallel_chains = 4,
+                                   adapt_delta = 0.9, max_treedepth = 13) {
+  # compile
+  if(n_k_f > 0) {
+    model <- cmdstan_model(stan_file = 'stan/normal.stan',
+                                include_paths = ".")
+  } else {
+    model <- cmdstan_model(stan_file = 'stan/single_task_normal.stan',
+                                include_paths = ".")
+  }
+  # format data
+  out <- make_stan_data(enquo(outcome), enquo(trt), enquo(unit),
+                        enquo(time), t_int, data)
+  out$pop = out$pop / 1e5
+  standata <- list(x = out$x,
+                   y = out$y / out$pop,
+                   inv_population = 1 / out$pop,
+                   N = length(out$x),
+                   D = ncol(out$y),
+                   n_k_f = n_k_f,
+                   control_idx = out$control_idx,
+                   num_treated = length(out$y) - length(out$control_idx),
+                   treatment_idx=out$treated_idx
+                  )
+  # sample from model
+  fit <- model$sample(data = standata,
+                      iter_warmup = iter_warmup,
+                      iter_sampling = iter_sampling,
+                      chains = chains,
+                      parallel_chains = parallel_chains,
+                      adapt_delta = adapt_delta,
+                      max_treedepth = max_treedepth)
+return(fit)
+}
+
+
+fit_mtgp_pois <- function(outcome, trt, unit, time, t_int, data, n_k_f,
+                          iter_warmup = 1000, iter_sampling = 1000,
+                          chains = 4, parallel_chains = 4,
+                          adapt_delta = 0.9, max_treedepth = 13) {
+  # compile
+  if(n_k_f > 0) {
+    model <- cmdstan_model(stan_file = 'stan/poisson.stan',
+                                include_paths = ".")
+  }else{
+    model <- cmdstan_model(stan_file = 'stan/single_task_poisson.stan',
+                                include_paths = ".")
+  }
+  # format data
+  out <- make_stan_data(enquo(outcome), enquo(trt), enquo(unit),
+                        enquo(time), t_int, data)
+  standata <- list(x = out$x,
+                   y = c(out$y),
+                   population = out$pop,
+                   N = length(out$x),
+                   D = ncol(out$y),
+                   n_k_f = n_k_f,
+                   control_idx = out$control_idx,
+                   num_treated = length(out$y) - length(out$control_idx)
+                  )
+  # sample from model
+  fit <- model$sample(data = standata,
+                      iter_warmup = iter_warmup,
+                      iter_sampling = iter_sampling,
+                      chains = chains,
+                      parallel_chains = parallel_chains,
+                      adapt_delta = adapt_delta,
+                      max_treedepth = max_treedepth)
+return(fit)
+}
+```
+
+
+# Fit Poisson GP
+
+```{r fit_mtgp_pois_ranks, warning = F, message = F, cache = T, results = "hide"}
+get_posterior_pois <- function(fit_mtgp) {
+  draws <- as_draws_matrix(fit_mtgp$draws())
+  means <- subset(draws, variable = "f")
+  
+  # sample from posterior with rate and intercepts
+  posts <- matrix(sapply(c(means), rpois, n = 1), ncol = ncol(means))
+  return(posts)
+}
+
+ranks <- 0:7
+fit_ranks_pois <- lapply(ranks, fit_mtgp_pois, outcome = homicide,
+                    trt = treated,
+                    unit = State, time = year, t_int = 2007,
+                    data = crimes %>% filter(year >= start_year))
+
+
+posts_pois <- lapply(fit_ranks_h, get_posterior_pois, pops = pops)
+post_pred_ranks_pois <- lapply(posts_h, get_post_pred_samples, unit=State, 
+                               time=year,
+                                data = crimes %>% filter(year >= start_year))
+saveRDS(fit_ranks_pois, "mtgp_fits_poisson.RDS")
+```
+
+# Fit Gaussian GP
+
+```{r fit_mtgp_ho_ranks, warning = F, message = F, cache = T, results = "hide"}
+get_posterior_homoskedastic <- function(fit_mtgp, pops) {
+    draws <- as_draws_matrix(fit_mtgp$draws())
+    posts <- subset(draws, variable = "f_samples")
+    return(posts)
+}
+
+ranks <- 0:7
+
+fit_ranks_gaus <- lapply(ranks, fit_mtgp_normal, outcome = homicide,
+                    trt = treated,
+                    unit = State, time = year, t_int = 2007,
+                    data = crimes %>% filter(year >= start_year))
+
+pops <- make_stan_data(quo(homicide), quo(treated), quo(State), quo(year), 2007,
+                       crimes %>% filter(year >= start_year))$pop
+
+posts_gaus <- lapply(fit_ranks_h, get_posterior_homoskedastic, pops = pops)
+
+post_pred_ranks_gaus <- lapply(posts_h, get_post_pred_samples, unit = State,
+                          time = year,
+                          data = crimes %>% filter(year >= start_year))
+names(post_pred_ranks_gaus) <- ranks
+
+saveRDS(fit_ranks_h, "mtgp_fits_homoskedastic.RDS")
+```
+
