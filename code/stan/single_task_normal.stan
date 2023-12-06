@@ -5,13 +5,13 @@ data {
   matrix[N, D] y;         // target variable
   matrix[N, D] inv_population;
   int num_treated;
-  int control_idx[N * D - num_treated];
+  array[N * D - num_treated] int control_idx;
 }
 transformed data {
   // Normalize data
   real xmean = mean(x);
   real xsd = sd(x);
-  real xn[N] = to_array_1d((x - xmean)/xsd);
+  array[N] real xn = to_array_1d((x - xmean)/xsd);
   real sigma_intercept = 0.1;
   vector[N] jitter = rep_vector(1e-9, N);
 }

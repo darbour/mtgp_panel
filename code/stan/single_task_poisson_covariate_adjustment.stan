@@ -3,9 +3,9 @@ data {
   int<lower=1> D;      // number of units
   vector[N] x;         // univariate covariate
   matrix[N, D] population;
-  int<lower=0> y[N * D];         // target variable
+  array[N * D] int<lower=0> y;         // target variable
   int num_treated;
-  int control_idx[N * D - num_treated];
+  array[N * D - num_treated] int control_idx;
   int<lower=1> num_covariates;
   matrix[D, num_covariates] covariates;
 }
@@ -13,7 +13,7 @@ transformed data {
   // Normalize data
   real xmean = mean(x);
   real xsd = sd(x);
-  real xn[N] = to_array_1d((x - xmean)/xsd);
+  array[N] real xn = to_array_1d((x - xmean)/xsd);
   real sigma_intercept = 0.1;
   vector[N] jitter = rep_vector(1e-9, N);
 }
@@ -23,7 +23,7 @@ parameters {
   vector[N] z_global;
   row_vector[D] state_offset;
   real intercept;
-  vector[num_covariates] cov_beta[D];
+  array[D] vector[num_covariates] cov_beta;
 }
 model {
   matrix[N, N] K_global = gp_exp_quad_cov(xn, sigma_global, lengthscale_global);

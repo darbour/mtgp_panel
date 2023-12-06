@@ -3,15 +3,15 @@ data {
   int<lower=1> D;      // number of units
   vector[N] x;         // univariate covariate
   matrix[N, D] population;
-  int<lower=0> y[N * D];         // target variable
+  array[N * D] int<lower=0> y;         // target variable
   int num_treated;
-  int control_idx[N * D - num_treated];
+  array[N * D - num_treated] int control_idx;
 }
 transformed data {
   // Normalize data
   real xmean = mean(x);
   real xsd = sd(x);
-  real xn[N] = to_array_1d((x - xmean)/xsd);
+  array[N] real xn = to_array_1d((x - xmean)/xsd);
   real sigma_intercept = 0.1;
   vector[N] jitter = rep_vector(1e-9, N);
 }
@@ -34,7 +34,12 @@ model {
 
   // index in to only consider the likelihood of the units under control
   y[control_idx] ~ poisson_log(
-    intercept + log(to_vector(population)[control_idx]) + to_vector(rep_matrix(state_offset, N) + rep_matrix(L_global * z_global, D) )[control_idx]);
+    intercept + 
+    log(to_vector(population)[control_idx]) + 
+    to_vector(
+      rep_matrix(state_offset, N) + 
+      rep_matrix(L_global * z_global, D) )[control_idx]
+    );
 }
 generated quantities {
   matrix[N, D] f;
@@ -52,6 +57,7 @@ generated quantities {
     for(i in 1:N){
       f_samples[i] = to_row_vector(poisson_log_rng(f[i]));
     }
+    // Note that the returned "f" is actually exp(f).
     f = exp(f);
   }
 }
