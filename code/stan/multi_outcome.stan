@@ -7,14 +7,14 @@ data {
   matrix[N, D] y[num_outcomes];         // target variable
   matrix[N, D] inv_population;
   int num_treated;
-  int control_idx[N * D - num_treated];
+  array[N * D - num_treated] int control_idx;
 }
 transformed data {
   //matrix[N, D] y_rate = y .* inv_population;
   // Normalize data
   real xmean = mean(x);
   real xsd = sd(x);
-  real xn[N] = to_array_1d((x - xmean)/xsd);
+  array[N] real xn = to_array_1d((x - xmean)/xsd);
   real sigma_intercept = 0.1;
   vector[N] jitter = rep_vector(1e-9, N);
 }
@@ -24,11 +24,14 @@ parameters {
   real<lower=0> lengthscale_f; // lengthscale of f
   real<lower=0> sigma_f[num_outcomes];       // scale of f
   real<lower=0> sigman[num_outcomes];
-  vector[D] state_offset[num_outcomes];
-  vector[N] z_global[num_outcomes];
+  //vector[D] state_offset[num_outcomes];
+  vector[num_outcomes] vector[D] state_offset;
+  //vector[N] z_global[num_outcomes];
+  array[num_outcomes] vector[N] z_global;
   matrix[N, n_k_f] z_f;
-  matrix[n_k_f, D] k_f[num_outcomes];
-  real global_offset[num_outcomes];
+  //matrix[n_k_f, D] k_f[num_outcomes];
+  array[num_outcomes] matrix[n_k_f, D] k_f;
+  array[num_outcomes] real global_offset;
 }
 
 model {
@@ -66,8 +69,10 @@ model {
   }
 }
 generated quantities {
-  matrix[N, D] f[num_outcomes];
-  matrix[N, D] f_samples[num_outcomes];
+  //matrix[N, D] f[num_outcomes];
+  array[num_outcomes] matrix[N,D] f;
+  //matrix[N, D] f_samples[num_outcomes];
+  array[num_outcomes] matrix[N,D] f_samples;
   int total_obs = N * D - num_treated;
   vector[N * D - num_treated] log_lik;
 

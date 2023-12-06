@@ -1,19 +1,19 @@
 data {
   int<lower=1> N;      // number of observations
-  int<lower=1> D;      // number of units
+  int<lower=1> D;      // number of units (states)
   int<lower=1> n_k_f;      // number of latent functions for f
-  vector[N] x;         // univariate covariate
-  matrix[N, D] y;         // target variable
-  matrix[N, D] inv_population;
+  vector[N] x;         // univariate covariate (time)
+  matrix[N, D] y;         // target variable (crime outcome)
+  matrix[N, D] inv_population;  // 1 / population in state D at time N
   int num_treated;
-  int control_idx[N * D - num_treated];
+  array[N * D - num_treated] int control_idx; // Control indices of a vectorized N x D matrix
 }
 transformed data {
   //matrix[N, D] y_rate = y .* inv_population;
   // Normalize data
   real xmean = mean(x);
   real xsd = sd(x);
-  real xn[N] = to_array_1d((x - xmean)/xsd);
+  array[N] real xn = to_array_1d((x - xmean)/xsd);
   real sigma_intercept = 0.1;
   vector[N] jitter = rep_vector(1e-9, N);
 }
@@ -22,11 +22,11 @@ parameters {
   real<lower=0> sigma_global;
   real<lower=0> lengthscale_f; // lengthscale of f
   real<lower=0> sigma_f;       // scale of f
-  real<lower=0> sigman;
-  vector[D] state_offset;
-  vector[N] z_global;
-  matrix[N, n_k_f] z_f;
-  matrix[n_k_f, D] k_f;
+  real<lower=0> sigman;   // observation residual scale 
+  vector[D] state_offset; // Per-state scalar offsets
+  vector[N] z_global;    // Whitened common time trend
+  matrix[N, n_k_f] z_f;  // Latent whitened time-correlated GPs
+  matrix[n_k_f, D] k_f;  // Per-state weights of z_f
   real global_offset;
 }
 

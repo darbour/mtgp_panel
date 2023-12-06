@@ -6,7 +6,7 @@ data {
   matrix[N, D] y;         // target variable
   matrix[N, D] inv_population;
   int num_treated;
-  int control_idx[N * D - num_treated];
+  array[N * D - num_treated] int control_idx;
   int<lower=1> num_covariates;
   matrix[D, num_covariates] covariates;
 }
@@ -14,7 +14,7 @@ transformed data {
   // Normalize data
   real xmean = mean(x);
   real xsd = sd(x);
-  real xn[N] = to_array_1d((x - xmean)/xsd);
+  array[N] real xn = to_array_1d((x - xmean)/xsd);
   real sigma_intercept = 0.1;
   vector[N] jitter = rep_vector(1e-9, N);
 }
@@ -24,7 +24,8 @@ parameters {
   real<lower=0> lengthscale_f; // lengthscale of f
   real<lower=0> sigma_f;       // scale of f
   real<lower=0> sigman;
-  vector[num_covariates] cov_beta[D];
+  // vector[num_covariates] cov_beta[D];
+  array[D] vector[num_covariates] cov_beta;
   vector[D] state_offset;
   vector[N] z_global;
   matrix[N, n_k_f] z_f;

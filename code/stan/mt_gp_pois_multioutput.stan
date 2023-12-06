@@ -6,15 +6,15 @@ data {
   int<lower=1> n_k_d;      // number of latent functions for units
   vector[N] x;         // univariate covariate
   matrix[N, D] population;
-  int<lower=0> y[num_outcomes, N * D];         // target variable
+  array[num_outcomes, N * D] int<lower=0> y;         // target variable
   int num_treated;
-  int control_idx[N * D - num_treated];
+  array[N * D - num_treated] int control_idx;
 }
 transformed data {
   // Normalize data
   real xmean = mean(x);
   real xsd = sd(x);
-  real xn[N] = to_array_1d((x - xmean)/xsd);
+  array[N] real xn = to_array_1d((x - xmean)/xsd);
   vector[N] jitter = rep_vector(1e-9, N);
 }
 parameters {
@@ -23,14 +23,15 @@ parameters {
 
   real<lower=0> lengthscale_global;
   real<lower=0> sigma_global;
-  //cholesky_factor_corr[num_outcomes] global_cov;
-  vector[N] z_global[num_outcomes];
-
+  //vector[N] z_global[num_outcomes];
+  array[num_outcomes] vector[N] z_global;
 
   matrix[N, n_k_f] z_f;
-  matrix[n_k_f, n_k_d] k_f[num_outcomes];
+  //matrix[n_k_f, n_k_d] k_f[num_outcomes];
+  array[num_outcomes] matrix[n_k_f, n_k_d]  k_f;
   matrix[n_k_d, D] k_d;
-  row_vector[D] intercepts[num_outcomes];
+  //row_vector[D] intercepts[num_outcomes];
+  array[num_outcomes] row_vector[D] intercepts;
 }
 model {
   // covariances and Cholesky decompositions
@@ -38,8 +39,10 @@ model {
   matrix[N, N] L_f = cholesky_decompose(add_diag(K_f, jitter));
   matrix[N, N] K_global = gp_exp_quad_cov(xn, sigma_global, lengthscale_global);
   matrix[N, N] L_global = cholesky_decompose(add_diag(K_global, jitter));
-  matrix[N, D] f[num_outcomes];
-  vector[N] f_global[num_outcomes];
+  //matrix[N, D] f[num_outcomes];
+  //vector[N] f_global[num_outcomes];
+  array[num_outcomes] matrix[N, D] f;
+  array[num_outcomes] vector[N] f_global;
 
   for(i in 1:num_outcomes) {
     f[i] = L_f * z_f * k_f[i] * k_d + rep_matrix(L_global * z_global[i], D);
@@ -66,7 +69,7 @@ model {
   }
 }
 generated quantities {
-  matrix[N, D] f[num_outcomes];
+  array[num_outcomes] matrix[N, D] f;
   {
     // covariances and Cholesky decompositions
     matrix[N, N] K_f = gp_exp_quad_cov(xn, sigma_f, lengthscale_f);
